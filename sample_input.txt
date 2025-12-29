@@ -1,0 +1,22 @@
+# Sample input.txt for BitCrack Key Pool Mode
+# Each line is a key fragment that will be:
+# 1. Repeated N times (default: 3)
+# 2. Prefixed with the specified hex prefix
+# 3. Padded to 256 bits
+#
+# Example: fragment "abc" with prefix "8000" and repeat=3
+# becomes: "8000" + "abcabcabc" padded to 64 hex chars
+#
+# Lines starting with # are comments and will be ignored
+# Empty lines are also ignored
+
+# Example fragments (hex format):
+1234
+5678
+abcd
+ef01
+
+# Example fragments (ASCII - will be converted to hex):
+# hello
+# world
+# test123

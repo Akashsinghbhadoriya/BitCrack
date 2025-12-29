@@ -9,11 +9,13 @@
 #include "CmdParse.h"
 #include "Logger.h"
 #include "ConfigFile.h"
+#include "KeyPool.h"
 
 #include "DeviceManager.h"
 
 #ifdef BUILD_CUDA
 #include "CudaKeySearchDevice.h"
+#include "CudaKeyPoolDevice.h"
 #endif
 
 #ifdef BUILD_OPENCL
@@ -37,9 +39,9 @@ typedef struct {
     unsigned int threads = 0;
     unsigned int blocks = 0;
     unsigned int pointsPerThread = 0;
-    
+
     int compression = PointCompressionType::COMPRESSED;
- 
+
     std::vector<std::string> targets;
 
     std::string targetsFile = "";
@@ -55,6 +57,13 @@ typedef struct {
     secp256k1::uint256 stride = 1;
 
     bool follow = false;
+
+    // Custom key pool settings
+    std::string keyPoolFile = "";       // Path to input.txt with key fragments
+    std::string keyPoolPrefix = "";     // Hex prefix to prepend
+    int chunkRepeat = 3;                // Number of times to repeat each chunk
+    bool randomMode = true;             // Enable random selection mode
+    bool useKeyPool = false;            // Flag to use key pool mode
 }RunConfig;
 
 static RunConfig _config;
@@ -191,7 +200,7 @@ void usage()
 {
     printf("BitCrack OPTIONS [TARGETS]\n");
     printf("Where TARGETS is one or more addresses\n\n");
-	
+
     printf("--help                  Display this message\n");
     printf("-c, --compressed        Use compressed points\n");
     printf("-u, --uncompressed      Use Uncompressed points\n");
@@ -209,12 +218,17 @@ void usage()
     printf("                          START:END\n");
     printf("                          START:+COUNT\n");
     printf("                          START\n");
-    printf("                          :END\n"); 
+    printf("                          :END\n");
     printf("                          :+COUNT\n");
     printf("                        Where START, END, COUNT are in hex format\n");
     printf("--stride N              Increment by N keys at a time\n");
     printf("--share M/N             Divide the keyspace into N equal shares, process the Mth share\n");
     printf("--continue FILE         Save/load progress from FILE\n");
+    printf("\nCustom Key Pool Options:\n");
+    printf("--keypool FILE          Read key fragments from FILE (enables key pool mode)\n");
+    printf("--prefix HEX            Hex prefix to prepend to each key (e.g., 8000000000000000)\n");
+    printf("--chunk-repeat N        Repeat each fragment N times (default: 3)\n");
+    printf("--sequential            Use sequential selection instead of random\n");
 }
 
 
@@ -364,6 +378,201 @@ void readCheckpointFile()
     }
 
     _config.totalkeys = (_config.nextKey - _config.startKey).toUint64();
+}
+
+// Forward declaration
+int run();
+int runKeyPoolMode();
+
+int runKeyPoolMode()
+{
+    if(_config.device < 0 || _config.device >= _devices.size()) {
+        Logger::log(LogLevel::Error, "device " + util::format(_config.device) + " does not exist");
+        return 1;
+    }
+
+#ifndef BUILD_CUDA
+    Logger::log(LogLevel::Error, "Key pool mode requires CUDA support");
+    return 1;
+#else
+
+    Logger::log(LogLevel::Info, "=== Key Pool Mode ===");
+    Logger::log(LogLevel::Info, "Compression: " + getCompressionString(_config.compression));
+
+    try {
+        // Initialize key pool
+        KeyPool::Config poolConfig;
+        poolConfig.inputFile = _config.keyPoolFile;
+        poolConfig.prefix = _config.keyPoolPrefix;
+        poolConfig.chunkRepeat = _config.chunkRepeat;
+        poolConfig.randomMode = _config.randomMode;
+        poolConfig.shuffle = _config.randomMode;
+
+        KeyPool keyPool;
+        if(!keyPool.init(poolConfig)) {
+            Logger::log(LogLevel::Error, "Failed to initialize key pool");
+            return 1;
+        }
+
+        Logger::log(LogLevel::Info, "Key pool initialized with " + std::to_string(keyPool.getTotalKeys()) + " keys");
+        Logger::log(LogLevel::Info, "Mode: " + std::string(_config.randomMode ? "Random" : "Sequential"));
+
+        _lastUpdate = util::getSystemTime();
+        _startTime = util::getSystemTime();
+
+        // Use default parameters if they have not been set
+        DeviceParameters params = getDefaultParameters(_devices[_config.device]);
+
+        if(_config.blocks == 0) {
+            _config.blocks = params.blocks;
+        }
+
+        if(_config.threads == 0) {
+            _config.threads = params.threads;
+        }
+
+        if(_config.pointsPerThread == 0) {
+            _config.pointsPerThread = params.pointsPerThread;
+        }
+
+        // Get the keys from the pool
+        const std::vector<secp256k1::uint256>& poolKeys = keyPool.getAllKeys();
+
+        if(poolKeys.empty()) {
+            Logger::log(LogLevel::Error, "No keys in pool");
+            return 1;
+        }
+
+        // Create key pool device
+        CudaKeyPoolDevice *poolDevice = new CudaKeyPoolDevice(
+            (int)_devices[_config.device].physicalId,
+            _config.threads,
+            _config.pointsPerThread,
+            _config.blocks
+        );
+
+        // Initialize with the pool keys
+        poolDevice->initWithPool(poolKeys, _config.compression);
+
+        // Set targets
+        std::set<KeySearchTarget> targetSet;
+        if(!_config.targetsFile.empty()) {
+            std::vector<std::string> lines;
+            if(!readAddressesFromFile(_config.targetsFile, lines)) {
+                Logger::log(LogLevel::Error, "Unable to read targets file");
+                delete poolDevice;
+                return 1;
+            }
+            for(const auto& addr : lines) {
+                if(Address::verifyAddress(addr)) {
+                    KeySearchTarget t;
+                    Base58::toHash160(addr, t.value);
+                    targetSet.insert(t);
+                }
+            }
+        } else {
+            for(const auto& addr : _config.targets) {
+                KeySearchTarget t;
+                Base58::toHash160(addr, t.value);
+                targetSet.insert(t);
+            }
+        }
+
+        if(targetSet.empty()) {
+            Logger::log(LogLevel::Error, "No valid targets");
+            delete poolDevice;
+            return 1;
+        }
+
+        poolDevice->setTargets(targetSet);
+        Logger::log(LogLevel::Info, util::format(targetSet.size()) + " target(s) loaded");
+
+        // Main processing loop
+        util::Timer timer;
+        timer.start();
+        uint64_t totalKeys = 0;
+        uint64_t prevTotal = 0;
+
+        Logger::log(LogLevel::Info, "Starting key pool search...");
+
+        while(!poolDevice->isPoolExhausted() && !targetSet.empty()) {
+            poolDevice->doStep();
+
+            uint64_t keysThisStep = poolDevice->keysPerStep();
+            totalKeys += keysThisStep;
+
+            // Status update
+            uint64_t t = timer.getTime();
+            if(t >= _config.statusInterval) {
+                double seconds = (double)t / 1000.0;
+                uint64_t keysProcessed = totalKeys - prevTotal;
+                double speed = (double)keysProcessed / seconds / 1000000.0;
+
+                uint64_t freeMem, totalMem;
+                poolDevice->getMemoryInfo(freeMem, totalMem);
+
+                std::string speedStr = util::format("%.2f", speed) + " MKey/s";
+                std::string totalStr = util::formatThousands(totalKeys) + " total";
+                std::string progressStr = util::format("%.1f%%",
+                    (double)poolDevice->getProcessedKeys() / (double)poolDevice->getTotalPoolKeys() * 100.0);
+
+                if(_config.follow) {
+                    printf("%s | %s | %s | %s\n",
+                        poolDevice->getDeviceName().substr(0, 16).c_str(),
+                        speedStr.c_str(),
+                        totalStr.c_str(),
+                        progressStr.c_str());
+                } else {
+                    printf("\r%s | %s | %s | %s    ",
+                        poolDevice->getDeviceName().substr(0, 16).c_str(),
+                        speedStr.c_str(),
+                        totalStr.c_str(),
+                        progressStr.c_str());
+                    fflush(stdout);
+                }
+
+                timer.start();
+                prevTotal = totalKeys;
+            }
+
+            // Check for results
+            std::vector<KeySearchResult> results;
+            if(poolDevice->getResults(results) > 0) {
+                for(const auto& result : results) {
+                    resultCallback(result);
+
+                    // Remove from target set
+                    KeySearchTarget t;
+                    memcpy(t.value, result.hash, 20);
+                    targetSet.erase(t);
+                }
+
+                // Update targets on device
+                poolDevice->setTargets(targetSet);
+            }
+        }
+
+        printf("\n");
+
+        if(poolDevice->isPoolExhausted()) {
+            Logger::log(LogLevel::Info, "Key pool exhausted - all keys processed");
+        }
+
+        if(targetSet.empty()) {
+            Logger::log(LogLevel::Info, "All targets found!");
+        }
+
+        Logger::log(LogLevel::Info, "Total keys processed: " + util::formatThousands(totalKeys));
+
+        delete poolDevice;
+
+    } catch(KeySearchException ex) {
+        Logger::log(LogLevel::Info, "Error: " + ex.msg);
+        return 1;
+    }
+
+    return 0;
+#endif
 }
 
 int run()
@@ -517,6 +726,11 @@ int main(int argc, char **argv)
     parser.add("", "--continue", true);
     parser.add("", "--share", true);
     parser.add("", "--stride", true);
+    // Custom key pool arguments
+    parser.add("", "--keypool", true);
+    parser.add("", "--prefix", true);
+    parser.add("", "--chunk-repeat", true);
+    parser.add("", "--sequential", false);
 
     try {
         parser.parse(argc, argv);
@@ -602,6 +816,18 @@ int main(int argc, char **argv)
                 }
             } else if(optArg.equals("-f", "--follow")) {
                 _config.follow = true;
+            } else if(optArg.equals("", "--keypool")) {
+                _config.keyPoolFile = optArg.arg;
+                _config.useKeyPool = true;
+            } else if(optArg.equals("", "--prefix")) {
+                _config.keyPoolPrefix = optArg.arg;
+            } else if(optArg.equals("", "--chunk-repeat")) {
+                _config.chunkRepeat = util::parseUInt32(optArg.arg);
+                if(_config.chunkRepeat < 1) {
+                    throw std::string("chunk-repeat must be at least 1");
+                }
+            } else if(optArg.equals("", "--sequential")) {
+                _config.randomMode = false;
             }
 
 		} catch(std::string err) {
@@ -676,5 +902,10 @@ int main(int argc, char **argv)
         readCheckpointFile();
     }
 
-    return run();
+    // Choose appropriate run mode
+    if(_config.useKeyPool) {
+        return runKeyPoolMode();
+    } else {
+        return run();
+    }
 }
